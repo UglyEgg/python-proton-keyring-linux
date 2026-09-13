@@ -21,6 +21,7 @@ You should have received a copy of the GNU General Public License
 along with ProtonVPN.  If not, see <https://www.gnu.org/licenses/>.
 """
 from proton.keyring_linux.core import KeyringBackendLinux
+import logging
 import pytest
 from unittest import mock
 import json
@@ -81,18 +82,30 @@ def test_get_item_raises_exception_corrupted_data(mock_backend, keyring_service)
         k._get_item("test")
 
 
-def test_del_item_raises_exception_missing_key(mock_backend, keyring_service):
+def test_del_item_raises_exception_missing_key_without_error_log(
+        mock_backend, keyring_service, caplog
+):
     mock_backend.delete_password.side_effect = errors.PasswordDeleteError()
     k = KeyringBackendLinux(keyring_backend=mock_backend)
-    with pytest.raises(KeyError):
-        k._del_item("test")
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(KeyError):
+            k._del_item("test")
+
+    assert "Keyring entry is already absent" in caplog.messages
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
 
 
-def test_del_item_raises_exception_keyring_error(mock_backend, keyring_service):
+def test_del_item_raises_exception_keyring_error(
+        mock_backend, keyring_service, caplog
+):
     mock_backend.delete_password.side_effect = errors.KeyringError()
     k = KeyringBackendLinux(keyring_backend=mock_backend)
-    with pytest.raises(KeyringError):
-        k._del_item("test")
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(KeyringError):
+            k._del_item("test")
+
+    assert "Keyring error while deleting" in caplog.messages
+    assert any(record.exc_info is not None for record in caplog.records)
 
 
 def test_set_item_raises_exception_keyring_unable_to_add(mock_backend, keyring_service):

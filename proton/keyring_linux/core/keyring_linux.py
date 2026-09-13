@@ -75,7 +75,7 @@ class KeyringBackendLinux(Keyring):  # pylint: disable=too-few-public-methods
         try:
             self.__keyring_backend.delete_password(self.KEYRING_SERVICE, key)
         except keyring.errors.PasswordDeleteError as excp:
-            logging.exception("Unable to delete entry from keyring")
+            logger.debug("Keyring entry is already absent")
             raise KeyError(key) from excp
         except keyring.errors.KeyringError as excp:
             logging.exception("Keyring error while deleting")
