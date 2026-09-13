@@ -20,15 +20,14 @@ BuildRoot: %{_tmppath}/%{pep_625_name}-%{version}-%{release}-buildroot
 
 BuildRequires: python3-devel
 BuildRequires: python3-setuptools
-BuildRequires: gnome-keyring
 BuildRequires: python3-keyring
 BuildRequires: python3-secretstorage 
 BuildRequires: python3-proton-core
 
-Requires: gnome-keyring
 Requires: python3-keyring
 Requires: python3-secretstorage 
 Requires: python3-proton-core
+Suggests: gnome-keyring
 
 Conflicts: python3-proton-keyring-linux-secretservice < 0.1.0
 Obsoletes: python3-proton-keyring-linux-secretservice

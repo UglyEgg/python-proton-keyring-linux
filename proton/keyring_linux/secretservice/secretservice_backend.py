@@ -19,14 +19,159 @@ You should have received a copy of the GNU General Public License
 along with ProtonVPN.  If not, see <https://www.gnu.org/licenses/>.
 """
 import json
-import os
-
 import logging
+import os
+import threading
+import weakref
+
 import keyring
+from keyring.credentials import SimpleCredential
 from proton.keyring.exceptions import KeyringLocked, KeyringError
 from proton.keyring_linux.core import KeyringBackendLinux
 
 logger = logging.getLogger(__name__)
+
+
+def _get_secret_service_backend():
+    """Return Python Keyring's Secret Service backend with safer collection lookup."""
+    # pylint: disable=import-outside-toplevel
+    import secretstorage
+    from keyring.backends import SecretService
+
+    class ProviderAgnosticSecretServiceKeyring(SecretService.Keyring):
+        """Secret Service backend with provider-agnostic collection handling.
+
+        A Secret Service client is identified by its unique D-Bus connection.
+        Keep one connection for the lifetime of this backend so providers can
+        remember authorization decisions across multiple keyring operations.
+        """
+
+        def __init__(self):
+            super().__init__()
+            self._connection = None
+            self._connection_finalizer = None
+            self._operation_lock = threading.RLock()
+
+        def _get_connection(self):
+            if self._connection is None:
+                self._connection = secretstorage.dbus_init()
+                self._connection_finalizer = weakref.finalize(
+                    self, self._connection.close
+                )
+            return self._connection
+
+        def close(self):
+            """Close the persistent D-Bus connection, if it was opened."""
+            with self._operation_lock:
+                if (
+                    self._connection_finalizer is not None
+                    and self._connection_finalizer.alive
+                ):
+                    self._connection_finalizer()
+                self._connection = None
+                self._connection_finalizer = None
+
+        def get_preferred_collection(self):
+            connection = self._get_connection()
+            try:
+                if hasattr(self, "preferred_collection"):
+                    collection = secretstorage.Collection(
+                        connection, self.preferred_collection
+                    )
+                else:
+                    collection = self._get_default_or_only_collection(
+                        secretstorage, connection
+                    )
+            except secretstorage.exceptions.SecretStorageException as excp:
+                raise keyring.errors.InitError(
+                    f"Failed to get a Secret Service collection: {excp}."
+                ) from excp
+
+            if collection.is_locked():
+                collection.unlock()
+                if collection.is_locked():
+                    raise keyring.errors.KeyringLocked(
+                        "Failed to unlock the collection!"
+                    )
+            return collection
+
+        def get_password(self, service, username):
+            """Get a password without discarding the D-Bus client identity."""
+            with self._operation_lock:
+                collection = self.get_preferred_collection()
+                items = collection.search_items(self._query(service, username))
+                for item in items:
+                    self.unlock(item)
+                    return item.get_secret().decode("utf-8")
+            return None
+
+        def set_password(self, service, username, password):
+            """Set a password using the persistent D-Bus connection."""
+            with self._operation_lock:
+                collection = self.get_preferred_collection()
+                attributes = self._query(
+                    service, username, application=self.appid
+                )
+                label = f"Password for '{username}' on '{service}'"
+                collection.create_item(
+                    label, attributes, password, replace=True
+                )
+
+        def delete_password(self, service, username):
+            """Delete a password using the persistent D-Bus connection."""
+            with self._operation_lock:
+                collection = self.get_preferred_collection()
+                items = collection.search_items(self._query(service, username))
+                for item in items:
+                    return item.delete()
+            raise keyring.errors.PasswordDeleteError("No such password!")
+
+        def get_credential(self, service, username):
+            """Get a credential using the persistent D-Bus connection."""
+            with self._operation_lock:
+                scheme = self.schemes[self.scheme]
+                query = self._query(service, username)
+                collection = self.get_preferred_collection()
+                items = collection.search_items(query)
+                for item in items:
+                    self.unlock(item)
+                    item_username = item.get_attributes().get(
+                        scheme["username"]
+                    )
+                    return SimpleCredential(
+                        item_username, item.get_secret().decode("utf-8")
+                    )
+            return None
+
+        @staticmethod
+        def _get_default_or_only_collection(secretstorage_module, connection):
+            try:
+                return secretstorage_module.get_collection_by_alias(
+                    connection, "default"
+                )
+            except secretstorage_module.exceptions.ItemNotFoundException:
+                collections = list(
+                    secretstorage_module.get_all_collections(connection)
+                )
+
+                if len(collections) == 1:
+                    logger.warning(
+                        "The default Secret Service collection alias is unavailable; "
+                        "using the only advertised collection"
+                    )
+                    return collections[0]
+
+                if not collections:
+                    return secretstorage_module.create_collection(
+                        connection, "Default", "default"
+                    )
+
+                raise keyring.errors.InitError(
+                    "The default Secret Service collection alias is unavailable "
+                    "and the provider advertises multiple collections"
+                )
+
+    return ProviderAgnosticSecretServiceKeyring()
 
 
 # pylint: disable=too-few-public-methods
@@ -42,17 +187,17 @@ class KeyringBackendLinuxSecretService(KeyringBackendLinux):
         if os.environ.get("SNAP") is not None:
             return False
         try:
-            # pylint: disable=import-outside-toplevel
-            from keyring.backends import SecretService
-            return cls._is_backend_working(SecretService.Keyring())
-        except ModuleNotFoundError:
-            logger.debug("Gnome-Keyring module not found")
+            # Python Keyring's priority check verifies that SecretStorage is
+            # installed and org.freedesktop.secrets is owned or activatable.
+            # Do not probe with get_password(): that requires a usable default
+            # collection and can create one as a side effect.
+            return _get_secret_service_backend().priority > 0
+        except (ModuleNotFoundError, RuntimeError):
+            logger.debug("Secret Service backend not available", exc_info=True)
             return False
 
     def __init__(self):
-        # pylint: disable=import-outside-toplevel
-        from keyring.backends import SecretService
-        self._backend = SecretService.Keyring()
+        self._backend = _get_secret_service_backend()
         super().__init__(self._backend)
 
     def _get_item(self, key):
