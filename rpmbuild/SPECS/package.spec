@@ -27,7 +27,11 @@ BuildRequires: python3-proton-core
 Requires: python3-keyring
 Requires: python3-secretstorage 
 Requires: python3-proton-core
+%if 0%{?fedora} >= 45
+Suggests: (gnome-keyring or oo7-daemon)
+%else
 Suggests: gnome-keyring
+%endif
 
 Conflicts: python3-proton-keyring-linux-secretservice < 0.1.0
 Obsoletes: python3-proton-keyring-linux-secretservice
